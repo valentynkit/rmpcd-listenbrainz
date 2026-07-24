@@ -1,10 +1,10 @@
 ---@diagnostic disable: undefined-global
 -- ListenBrainz scrobbler plugin for rmpcd.
 --
--- Submits "playing now" on track start and a "single" listen once the track
--- passes ListenBrainz's threshold (half its length or 4 minutes, whichever is
--- lower). Sends MusicBrainz IDs when the file is tagged. Modeled on rmpcd's
--- built-in Last.fm plugin; auth is a single ListenBrainz user token.
+-- Submits "playing now" on track start and a "single" listen once the track has
+-- been *played* (paused time excluded) for half its length or 4 minutes,
+-- whichever is lower. Sends MusicBrainz IDs when the file is tagged. Modeled on
+-- rmpcd's built-in Last.fm plugin; auth is a single ListenBrainz user token.
 --
 -- rmpcd exposes no JSON encoder and no package.path, so a tiny purpose-built
 -- encoder is embedded below (the submit payload is a fixed shape).
@@ -97,13 +97,6 @@ function Deque:peek_left()
     return self[self.first]
 end
 
-function Deque:peek_right()
-    if self.first > self.last then
-        return nil
-    end
-    return self[self.last]
-end
-
 --------------------------------------------------------------------------------
 -- Payload + submission
 --------------------------------------------------------------------------------
@@ -175,7 +168,7 @@ local function submit(self, body)
         log.error("ListenBrainz rejected a listen (HTTP " .. tostring(code) .. "), dropping it")
         return "drop"
     end
-    -- 429, 5xx, or nil (network failure) => keep it and retry later.
+    -- 429, 5xx, or nil (network failure) => keep it and retry on the next event.
     log.warn("ListenBrainz submit failed (HTTP " .. tostring(code) .. "), will retry")
     return "retry"
 end
@@ -205,23 +198,48 @@ local function process_queue(self)
     end
 end
 
-local function enqueue(self, song, timestamp)
-    local tail = self.queue:peek_right()
-    if tail == nil or tail.timestamp < timestamp then
-        self.queue:push_right({ song = song, timestamp = timestamp })
-    end
-end
-
-local function should_scrobble(song_start, now, song)
-    if song_start == nil or not scrobblable(song) then
+local function should_scrobble(song, played_secs)
+    if not scrobblable(song) then
         return false
     end
     local duration_ms = song.duration or 0
     if duration_ms < MIN_TRACK_MS then
         return false
     end
-    local elapsed = now - song_start
-    return elapsed >= MAX_SCROBBLE_SECS or elapsed >= (duration_ms / 1000) / 2
+    return played_secs >= MAX_SCROBBLE_SECS or played_secs >= (duration_ms / 1000) / 2
+end
+
+--------------------------------------------------------------------------------
+-- Play-time accounting. Tracks seconds actually played (paused time excluded)
+-- so a paused-through track is not scrobbled and a resumed one is not lost.
+--------------------------------------------------------------------------------
+
+-- Seconds of the current song played so far, including the in-progress segment.
+local function played_secs(self, now)
+    local played = self.played
+    if self.playing_since ~= nil then
+        played = played + (now - self.playing_since)
+    end
+    return played
+end
+
+-- Freeze the play clock (on pause/stop): fold the open segment into `played`.
+local function pause_clock(self, now)
+    if self.playing_since ~= nil then
+        self.played = self.played + (now - self.playing_since)
+        self.playing_since = nil
+    end
+end
+
+-- Queue the current song once if it has passed the threshold.
+local function try_scrobble(self, now)
+    if self.scrobbled or not self.enabled or self.current_song == nil then
+        return
+    end
+    if should_scrobble(self.current_song, played_secs(self, now)) then
+        self.queue:push_right({ song = self.current_song, timestamp = self.started_at })
+        self.scrobbled = true
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -237,8 +255,11 @@ M.setup = function(self, args)
     self.record_now_playing = args.record_now_playing ~= false
     self.enabled = args.enabled ~= false
     self.queue = Deque.new()
-    self.song_start = nil
     self.current_song = nil
+    self.started_at = nil -- epoch seconds of first playback of the current song
+    self.played = 0 -- accumulated played seconds, paused segments excluded
+    self.playing_since = nil -- epoch of the open play segment, nil while paused
+    self.scrobbled = false -- current song already queued?
 
     if self.token == nil or self.token == "" then
         log.error("ListenBrainz plugin has no token configured, disabling it")
@@ -246,40 +267,44 @@ M.setup = function(self, args)
     end
 end
 
-M.song_change = function(self, old, new)
-    if not self.enabled then
-        self.song_start = new ~= nil and os.time() or nil
-        self.current_song = new
-        return
-    end
+M.song_change = function(self, _old, new)
+    local now = os.time()
 
-    if new ~= nil and self.record_now_playing then
+    -- Finalize the outgoing song, then start the incoming one. Assume the new
+    -- song is playing; state_change corrects it if playback is actually paused.
+    try_scrobble(self, now)
+
+    self.current_song = new
+    self.started_at = new ~= nil and now or nil
+    self.played = 0
+    self.playing_since = new ~= nil and now or nil
+    self.scrobbled = false
+
+    if self.enabled and new ~= nil and self.record_now_playing then
         send_now_playing(self, new)
     end
 
-    local now = os.time()
-    if old ~= nil and should_scrobble(self.song_start, now, old) then
-        enqueue(self, old, self.song_start)
-    end
-
-    self.song_start = now
-    self.current_song = new
     process_queue(self)
 end
 
-M.state_change = function(self, old, new)
-    if not self.enabled then
-        return
-    end
-    if old == "play" and new ~= "play" then
-        local now = os.time()
-        if should_scrobble(self.song_start, now, self.current_song) then
-            enqueue(self, self.current_song, self.song_start)
+M.state_change = function(self, _old, new)
+    local now = os.time()
+
+    if new == "play" then
+        if self.current_song ~= nil then
+            if self.playing_since == nil then
+                self.playing_since = now
+            end
+            if self.started_at == nil then
+                self.started_at = now
+            end
         end
-        self.song_start = nil
-        self.current_song = nil
-        process_queue(self)
+    else -- pause or stop: freeze the clock, scrobble if already eligible
+        pause_clock(self, now)
+        try_scrobble(self, now)
     end
+
+    process_queue(self)
 end
 
 M.subscribed_channels = { "rmpcd.listenbrainz" }

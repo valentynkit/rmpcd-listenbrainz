@@ -50,9 +50,10 @@ rmpc sendmessage rmpcd.listenbrainz toggle    # or: enable / disable
 ## How it works
 
 - On track change it sends `playing_now` (unless `record_now_playing = false`).
-- It records a `single` listen once play time reaches
+- It records a `single` listen once *played* time (paused time excluded) reaches
   `min(track_length / 2, 4 minutes)`. Tracks shorter than 5 seconds or of unknown
-  length are skipped, following ListenBrainz guidance.
+  length are skipped, following ListenBrainz guidance. Pausing and resuming keeps
+  the count accurate, and each track is scrobbled at most once.
 - It sends `recording_mbid`, `release_mbid`, `release_group_mbid` and
   `artist_mbids` from your `MUSICBRAINZ_*` tags when present.
 - Failed submissions are retried from an in-memory queue. A permanently rejected
@@ -62,10 +63,12 @@ rmpc sendmessage rmpcd.listenbrainz toggle    # or: enable / disable
 
 - The retry queue lives in memory, so a backlog is lost if rmpcd restarts while
   ListenBrainz is unreachable.
-- rmpcd's HTTP API does not expose response headers, so rate-limit backoff is
-  time-based rather than driven by `X-RateLimit-Reset-In`.
-- Pausing and resuming a track resets its scrobble timer (same behaviour as the
-  built-in Last.fm plugin).
+- rmpcd's HTTP API does not expose response headers, so a rejected submission is
+  retried on the next playback event rather than after the server's
+  `X-RateLimit-Reset-In` window.
+- Changing tracks while playback is paused is treated as if the new track were
+  playing until the next state change (a rare edge; ordinary pause/resume is
+  accounted for accurately).
 
 ## Development
 
