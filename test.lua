@@ -211,4 +211,32 @@ clock = 1200
 M:state_change("play", "pause") -- any later event drains the queue
 assert(#bodies > attempts_after_429, "queued listen retried on next event")
 
+--------------------------------------------------------------------------------
+-- 10. stop ends the listen: replaying the same stopped song scrobbles fresh
+--------------------------------------------------------------------------------
+reset()
+clock = 1000
+M:song_change(nil, song) -- 200s track, threshold 100s
+clock = 1150
+M:state_change("play", "stop") -- played 150s => scrobble #1 (listened_at 1000), then reset
+assert(count_listen_type("single") == 1, "scrobbled on stop")
+clock = 2000
+M:state_change("stop", "play") -- replay the same song from stop = new listen
+clock = 2150
+M:state_change("play", "stop") -- played 150s again => scrobble #2 (listened_at 2000)
+assert(count_listen_type("single") == 2, "replay after stop is a fresh scrobble")
+
+--------------------------------------------------------------------------------
+-- 11. stop under threshold does not scrobble, and clears the session
+--------------------------------------------------------------------------------
+reset()
+clock = 1000
+M:song_change(nil, song)
+clock = 1050 -- only 50s < 100s threshold
+M:state_change("play", "stop") -- no scrobble, session reset
+assert(count_listen_type("single") == 0, "sub-threshold stop does not scrobble")
+clock = 1060
+M:song_change(song, make_song(200000)) -- previous song must not resurface
+assert(count_listen_type("single") == 0, "no stale carryover after stop")
+
 print("all tests passed")

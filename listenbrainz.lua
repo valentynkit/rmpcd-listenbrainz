@@ -302,6 +302,14 @@ M.state_change = function(self, _old, new)
     else -- pause or stop: freeze the clock, scrobble if already eligible
         pause_clock(self, now)
         try_scrobble(self, now)
+        if new == "stop" then
+            -- stop ends the listen (unlike pause); a later play of the same
+            -- song starts a fresh one. Resets the session so nothing carries over.
+            self.played = 0
+            self.playing_since = nil
+            self.started_at = nil
+            self.scrobbled = false
+        end
     end
 
     process_queue(self)
